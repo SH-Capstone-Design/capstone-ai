@@ -192,3 +192,21 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+# Python
+__pycache__/
+*.pyc
+.venv/
+env/
+*.log
+
+# Secrets
+*.env
+kc_ai_app/.env
+
+# IDE
+.vscode/
+.idea/
+
+# 학습/임시 산출물(있다면)
+runs/
+outputs/
