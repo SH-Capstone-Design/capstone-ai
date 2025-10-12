@@ -7,6 +7,7 @@ import dateutil.parser
 import os
 from dotenv import load_dotenv
 from pathlib import Path
+from kc_ai_app.src.label_map import LABEL_DISPLAY_MAP  # 사용자 표시 라벨 매핑
 
 # ==============================
 # 환경 변수 / 인증 (먼저, 명시 경로로 로드!)
@@ -80,6 +81,7 @@ def calculate_aggregated(emotions: List[EmotionResponse], start_at: str) -> Dict
     start_time = dateutil.parser.isoparse(start_at)
     minute_buckets: Dict[int, List[EmotionResponse]] = {}
 
+    # 1️⃣ 감정별 시간 버킷 분류
     for emo in emotions:
         analyzed_time = dateutil.parser.isoparse(emo.analyzed_at)
         minute = int((analyzed_time - start_time).total_seconds() // 60)
@@ -88,23 +90,28 @@ def calculate_aggregated(emotions: List[EmotionResponse], start_at: str) -> Dict
     timeline, overall_scores, overall_bf, overall_gf = [], {}, {}, {}
     count_bf, count_gf = 0, 0
 
+    # 2️⃣ 각 분 단위 집계
     for minute in sorted(minute_buckets.keys()):
         emo_list = minute_buckets[minute]
         avg_scores, bf_scores, gf_scores = {}, {}, {}
         bf_count = gf_count = 0
 
         for emo in emo_list:
+            # 세부 감정을 대표 감정으로 매핑
             for label, value in emo.scores.items():
-                avg_scores[label] = avg_scores.get(label, 0.0) + value
-            if emo.speaker == "BF":
-                bf_count += 1
-                for label, value in emo.scores.items():
-                    bf_scores[label] = bf_scores.get(label, 0.0) + value
-            elif emo.speaker == "GF":
-                gf_count += 1
-                for label, value in emo.scores.items():
-                    gf_scores[label] = gf_scores.get(label, 0.0) + value
+                display_label = LABEL_DISPLAY_MAP.get(label, label)
+                avg_scores[display_label] = avg_scores.get(display_label, 0.0) + value
 
+            # BF / GF 별도 집계
+            target_scores = bf_scores if emo.speaker == "BF" else gf_scores
+            if emo.speaker == "BF": bf_count += 1
+            if emo.speaker == "GF": gf_count += 1
+
+            for label, value in emo.scores.items():
+                display_label = LABEL_DISPLAY_MAP.get(label, label)
+                target_scores[display_label] = target_scores.get(display_label, 0.0) + value
+
+        # 평균 계산
         for label in avg_scores:
             avg_scores[label] /= max(len(emo_list), 1)
         for label in bf_scores:
@@ -119,6 +126,7 @@ def calculate_aggregated(emotions: List[EmotionResponse], start_at: str) -> Dict
             "gf_avg_scores": gf_scores
         })
 
+        # 전체 평균 계산용 누적
         for label, value in avg_scores.items():
             overall_scores[label] = overall_scores.get(label, 0.0) + value
         if bf_count > 0:
@@ -130,6 +138,7 @@ def calculate_aggregated(emotions: List[EmotionResponse], start_at: str) -> Dict
             for label, value in gf_scores.items():
                 overall_gf[label] = overall_gf.get(label, 0.0) + value
 
+    # 전체 평균 계산
     if len(timeline) > 0:
         for label in overall_scores:
             overall_scores[label] /= len(timeline)
@@ -170,12 +179,13 @@ def analyze_chat(request: ChatRequest, api_key: str = Depends(get_api_key)):
     for emo in request.emotions:
         current = {"speaker": emo.speaker, "text": emo.sentence}
         scores, label, confidence = analyze_sentence_with_context(history, current, context_size=2)
+        display_label = LABEL_DISPLAY_MAP.get(label, label)
         analyzed_emotions.append(
             EmotionResponse(
                 speaker=emo.speaker,
                 sentence=emo.sentence,
                 scores=scores,
-                emotion_label=label,
+                emotion_label=display_label,
                 confidence=confidence,
                 analyzed_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
             )
