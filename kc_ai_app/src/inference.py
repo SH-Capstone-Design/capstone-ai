@@ -1,7 +1,7 @@
 from typing import List, Dict, Tuple
 import os
 import torch
-from model.model_loader import load_model
+from kc_ai_app.model.model_loader import load_model
 
 LABELS = ["기쁨", "설렘", "애정", "편안함", "농담", "슬픔", "서운함", "실망", "후회", "미안함", "짜증", "화남", "질투", "불안", "의심", "중립"]
 
