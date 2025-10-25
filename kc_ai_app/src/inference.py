@@ -1,6 +1,7 @@
-# inference.py
+# kc_ai_app/src/inference.py
 # -*- coding: utf-8 -*-
 import os
+import functools
 from typing import List, Dict, Union, Optional, Tuple
 
 import torch
@@ -52,6 +53,11 @@ def load_model_and_tokenizer(
     model.eval().to(device)
     return tokenizer, model, device
 
+# ===== 모델 로딩 캐시(요청마다 재로딩 방지) =====
+@functools.lru_cache(maxsize=1)
+def _cached_load(model_id: str):
+    return load_model_and_tokenizer(model_id)
+
 def preprocess_texts(
     texts: List[str],
     speaker: Optional[str] = None,
@@ -69,7 +75,8 @@ def preprocess_texts(
 @torch.inference_mode()
 def predict_proba(
     tokenizer, model, device, texts: List[str],
-    max_length: int = 256, padding: str = "longest", batch_size: int = 32
+    max_length: int = 256, padding: str = "longest", batch_size: int = 32,
+    **_  # ← 호출부에서 넘어올 수 있는 labels 등 예기치 않은 키워드 무시
 ) -> List[Dict[str, float]]:
     """
     다중 문장 확률 예측.
@@ -130,8 +137,8 @@ def analyze_sentence_with_context(
             "MODEL_DIR 또는 FINETUNED_MODEL_PATH 환경변수가 필요합니다."
         )
 
-    # 1) 모델/토크나이저/디바이스 로드 (네 파일의 시그니처에 맞춤)
-    tokenizer, model, device = load_model_and_tokenizer(model_id)
+    # 1) 모델/토크나이저/디바이스 로드 (캐시 사용)
+    tokenizer, model, device = _cached_load(model_id)
 
     # 2) 문맥 구성: 최근 N개(history) + 현재 발화
     def _t(x: Optional[Dict[str, str]]) -> str:
@@ -143,8 +150,8 @@ def analyze_sentence_with_context(
     cur_text = _t(current)
     speaker = (current or {}).get("speaker")
 
-    # 3) 후보 라벨 세트(없으면 기본 LABELS 사용)
-    cand_labels = labels or LABELS
+    # 3) 후보 라벨 세트(없으면 기본 LABELS 사용) — 현재 모델 추론에는 직접 미사용
+    _ = labels or LABELS  # 유지: 호출부 호환성(넘어와도 에러 안 나게)
 
     # 4) 실제 추론 (predict_label은 Dict 반환: {"label","score","probs"})
     out = predict_label(
@@ -154,7 +161,7 @@ def analyze_sentence_with_context(
         text=cur_text,
         speaker=speaker,
         ctx=ctx_text,
-        labels=cand_labels,
+        labels=labels,  # 넘어올 수 있으므로 그대로 전달( predict_proba에서 **_로 무시 )
     )
     # api.py의 기대 형태에 맞게 변환
     scores = out["probs"]
