@@ -1,0 +1,72 @@
+# ===== OS 공통 =====
+.DS_Store
+Thumbs.db
+
+# ===== IDE =====
+.vscode/
+.idea/
+
+# ===== 보안/환경 =====
+.env
+.env.*
+*.pem
+*.key
+*.jks
+
+# ===== Python 기본 =====
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.venv/
+venv/
+ENV/
+env/
+*.egg-info/
+.eggs/
+dist/
+build/
+pip-wheel-metadata/
+.pytest_cache/
+.mypy_cache/
+.pytype/
+.cache/
+.ruff_cache/
+.pylint.d/
+.ipynb_checkpoints/
+
+# ===== 로그 =====
+logs/
+*.log
+uvicorn.log
+
+# ===== 데이터/캐시(로컬 전용) =====
+datasets/
+data/
+**/cache/
+**/.cache/
+.huggingface/
+transformers_cache/
+torch_cache/
+
+# ===== 대용량 모델/체크포인트(확장자 전역 무시) =====
+*.pt
+*.bin
+*.safetensors
+*.ckpt
+*.onnx
+*.h5
+*.pb
+*.tflite
+*.tar
+*.tar.gz
+*.zip
+
+# ===== model/ 폴더 정책 =====
+# model 폴더 안은 기본 무시하되, 파이썬 소스/README만 추적
+model/**
+!model/*.py
+!model/__init__.py
+!model/README.md
+!model/.gitkeep

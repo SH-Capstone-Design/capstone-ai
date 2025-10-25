@@ -7,7 +7,8 @@ import dateutil.parser
 import os
 from dotenv import load_dotenv
 from pathlib import Path
-from kc_ai_app.src.label_map import LABEL_DISPLAY_MAP  # 사용자 표시 라벨 매핑
+from .inference import load_model_and_tokenizer, predict_label, predict_proba
+from .label_map import LABEL_DISPLAY_MAP
 
 # ==============================
 # 환경 변수 / 인증 (먼저, 명시 경로로 로드!)
