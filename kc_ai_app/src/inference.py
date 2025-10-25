@@ -109,3 +109,55 @@ def predict_label(
     probs = predict_proba(tokenizer, model, device, proc, **kw)[0]
     label = max(probs, key=probs.get)
     return {"label": label, "score": probs[label], "probs": probs}
+
+# ---- compat shim: API가 기대하는 심볼 제공 ----
+def analyze_sentence_with_context(
+    history: Optional[List[Dict[str, str]]],
+    current: Dict[str, str],
+    context_size: int = 2,
+    labels: Optional[List[str]] = None,
+    **kwargs,
+):
+    """
+    history: [{"speaker":"BF|GF", "text" 또는 "sentence": "..."} ...]
+    current: {"speaker":"...", "text" 또는 "sentence":"..."}
+    반환: (scores: Dict[str, float], label: str, confidence: float)
+    """
+    # 0) 모델 경로/ID 결정 (로컬이든 허브 ID든 문자열이면 됨)
+    model_id = os.getenv("MODEL_DIR") or os.getenv("FINETUNED_MODEL_PATH")
+    if not model_id:
+        raise RuntimeError(
+            "MODEL_DIR 또는 FINETUNED_MODEL_PATH 환경변수가 필요합니다."
+        )
+
+    # 1) 모델/토크나이저/디바이스 로드 (네 파일의 시그니처에 맞춤)
+    tokenizer, model, device = load_model_and_tokenizer(model_id)
+
+    # 2) 문맥 구성: 최근 N개(history) + 현재 발화
+    def _t(x: Optional[Dict[str, str]]) -> str:
+        if not x:
+            return ""
+        return x.get("text") or x.get("sentence") or ""
+    hist = (history or [])[-int(context_size):]
+    ctx_text = " ".join([_t(h) for h in hist if _t(h)])
+    cur_text = _t(current)
+    speaker = (current or {}).get("speaker")
+
+    # 3) 후보 라벨 세트(없으면 기본 LABELS 사용)
+    cand_labels = labels or LABELS
+
+    # 4) 실제 추론 (predict_label은 Dict 반환: {"label","score","probs"})
+    out = predict_label(
+        tokenizer=tokenizer,
+        model=model,
+        device=device,
+        text=cur_text,
+        speaker=speaker,
+        ctx=ctx_text,
+        labels=cand_labels,
+    )
+    # api.py의 기대 형태에 맞게 변환
+    scores = out["probs"]
+    label = out["label"]
+    confidence = out["score"]
+    return scores, label, confidence
