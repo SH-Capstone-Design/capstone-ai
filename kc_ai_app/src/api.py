@@ -48,7 +48,7 @@ def _clamp01(x: float) -> float:
 # ==============================
 # 반올림 유틸(표시용) ★ 추가
 # ==============================
-ROUND_DIGITS = 5  # 소수 5자리 고정
+ROUND_DIGITS = 2  # 소수 2자리 고정
 
 def _round_scores(d: Dict[str, float], nd: int = ROUND_DIGITS) -> Dict[str, float]:
     return {k: round(float(v), nd) for k, v in d.items()}
