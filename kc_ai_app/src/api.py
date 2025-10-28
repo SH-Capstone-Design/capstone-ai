@@ -1,7 +1,7 @@
 # kc_ai_app/src/api.py
 from fastapi import FastAPI, Depends, HTTPException, Header
-from pydantic import BaseModel
-from typing import List, Dict, Optional, Any
+from pydantic import BaseModel, Field
+from typing import List, Dict, Optional, Any, Union
 from datetime import datetime, timezone
 import os
 from dotenv import load_dotenv
@@ -46,7 +46,7 @@ def _clamp01(x: float) -> float:
     return x
 
 # ==============================
-# 반올림 유틸(표시용) ★ 추가
+# 반올림 유틸(표시용)
 # ==============================
 ROUND_DIGITS = 2  # 소수 2자리 고정
 
@@ -69,6 +69,9 @@ def to_dict(model: BaseModel) -> Dict:
 
 # ===== 요청 스키마 =====
 class EmotionRequest(BaseModel):
+    """
+    speaker: "BF" | "GF" | 실제 userId(문자열/UUID/숫자) 허용
+    """
     speaker: str
     sentence: str
     sent_at: Optional[str] = None
@@ -78,7 +81,7 @@ class EmotionRequest(BaseModel):
 
 class ChatSession(BaseModel):
     chat_session_id: str
-    couple_id: int
+    couple_id: Union[int, str]
     start_at: str
     end_at: str
     duration_minutes: int
@@ -86,10 +89,17 @@ class ChatSession(BaseModel):
 class ChatRequest(BaseModel):
     chat_session: ChatSession
     emotions: List[EmotionRequest]
+    # 🔑 역할-사용자 매핑: {"BF":"<userId>", "GF":"<userId>"}
+    role_binding: Dict[str, str] = Field(default_factory=dict)
 
 # ===== 응답 스키마 =====
 class EmotionResponse(BaseModel):
-    speaker: str
+    # ✅ 규격: speaker = 실제 userId 문자열
+    speaker: Optional[str] = None
+    # 참고용(프론트/백엔드 디버깅에 유용)
+    userId: Optional[str] = None
+    alias: Optional[str] = None  # "BF"/"GF" 등 별칭(있으면)
+
     sentence: str
     scores: Dict[str, float]      # 항상 8라벨 키로 반환
     emotion_label: str
@@ -97,7 +107,7 @@ class EmotionResponse(BaseModel):
     analyzed_at: str
     sent_at: Optional[str] = None
 
-# ===== 집계 유틸 =====
+# ===== 공용 유틸 =====
 def _parse_iso(s: str):
     return dateutil.parser.isoparse(s)
 
@@ -115,9 +125,6 @@ def _get_ts(emo: Any):
 def _get_scores(emo: Any) -> Dict[str, float]:
     s = _get(emo, "scores") or {}
     return s
-
-def _get_speaker(emo: Any) -> str:
-    return _get(emo, "speaker")
 
 def _normalize_labels(scores: Dict[str, float]) -> Dict[str, float]:
     """
@@ -142,8 +149,54 @@ def _assert_inference_ready(emotions: List[Any]) -> None:
             f"(예: indices={missing[:10]}). 먼저 감정추론을 수행하세요."
         )
 
-def calculate_aggregated(emotions: List[Any], start_at: str, end_at: str) -> Dict:
-    _assert_inference_ready(emotions)
+# ===== speaker → userId 해석 =====
+def _looks_like_uuid_or_id(s: str) -> bool:
+    if not isinstance(s, str): 
+        return False
+    # 매우 느슨한 검사: UUID/숫자/혼합 문자열 허용
+    return True if len(s) >= 1 else False
+
+def _resolve_user_id(emo: EmotionRequest, role_binding: Dict[str, str]) -> Optional[str]:
+    spk = (emo.speaker or "").strip()
+    if spk in ("BF", "GF"):
+        uid = role_binding.get(spk)
+        return str(uid) if uid is not None else None
+    # 이미 userId를 직접 넣어준 경우
+    if _looks_like_uuid_or_id(spk):
+        return spk
+    return None
+
+def _alias_of(uid: Optional[str], role_binding: Dict[str, str]) -> Optional[str]:
+    if uid is None:
+        return None
+    for k, v in role_binding.items():
+        if str(v) == str(uid):
+            return k  # "BF" 또는 "GF"
+    return None
+
+# ===== 집계: userId 평면 키 {userId}_avg_scores =====
+def calculate_aggregated_user_centric(
+    emotions: List[EmotionResponse],
+    start_at: str,
+    end_at: str,
+    role_binding: Dict[str, str]
+) -> Dict[str, Any]:
+    """
+    출력:
+      timeline[i] = {
+        "minute": <int>,
+        "avg_scores": {...},
+        "<userId>_avg_scores": {...},   # 사용자 수 만큼 반복
+        ...
+      }
+      overall = {
+        "avg_scores": {...},            # 전체 평균
+        "<userId>_avg_scores": {...},   # 사용자 수 만큼 반복
+        ...
+      }
+    deprecated: 선택적으로 bf/gf 하위호환 제공
+    """
+    _assert_inference_ready([to_dict(e) for e in emotions])
 
     start_dt = _parse_iso(start_at)
     end_dt   = _parse_iso(end_at)
@@ -155,14 +208,11 @@ def calculate_aggregated(emotions: List[Any], start_at: str, end_at: str) -> Dic
     if total_minutes <= 0:
         raise ValueError(f"[aggregation] 세션 시간이 0분입니다. start_at={start_at}, end_at={end_at}")
 
-    labels = LABELS8
-
-    minute_buckets: Dict[int, List[Any]] = defaultdict(list)
+    minute_buckets: Dict[int, List[EmotionResponse]] = defaultdict(list)
     for emo in emotions:
-        ts = _get_ts(emo)
-        if not ts:
+        if not emo.sent_at:
             continue
-        ts_min = _to_utc_floor_min(_parse_iso(ts))
+        ts_min = _to_utc_floor_min(_parse_iso(emo.sent_at))
         minute = int((ts_min - start_min).total_seconds() // 60)
         if 0 <= minute < total_minutes:
             minute_buckets[minute].append(emo)
@@ -171,70 +221,81 @@ def calculate_aggregated(emotions: List[Any], start_at: str, end_at: str) -> Dic
         return {
             "interval": "1min",
             "timeline": [],
-            "overall": {
-                "avg_scores": {l:0.0 for l in labels},
-                "bf_avg_scores": {l:0.0 for l in labels},
-                "gf_avg_scores": {l:0.0 for l in labels},
-            }
+            "overall": { "avg_scores": {l: 0.0 for l in LABELS8} },
+            "deprecated": {}
         }
 
-    timeline = []
+    def _avg(sum_dict: Dict[str, float], denom: int) -> Dict[str, float]:
+        return {lab: _clamp01(sum_dict.get(lab, 0.0) / max(denom, 1)) for lab in LABELS8}
+
+    # 전체 합산
     overall_sum: Dict[str, float] = defaultdict(float)
-    overall_bf_sum: Dict[str, float] = defaultdict(float)
-    overall_gf_sum: Dict[str, float] = defaultdict(float)
-    overall_cnt = overall_bf_cnt = overall_gf_cnt = 0
+    overall_cnt = 0
+    # per-user 합산
+    per_user_sum: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    per_user_cnt: Dict[str, int] = defaultdict(int)
+
+    timeline: List[Dict[str, Any]] = []
 
     for minute in sorted(minute_buckets.keys()):
         emos = minute_buckets[minute]
+
+        # 분 전체
         sum_all: Dict[str, float] = defaultdict(float)
-        sum_bf: Dict[str, float] = defaultdict(float)
-        sum_gf: Dict[str, float] = defaultdict(float)
-        cnt_bf = cnt_gf = 0
+        n_all = 0
+        # 분 per-user
+        sum_user: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
+        cnt_user: Dict[str, int] = defaultdict(int)
 
         for emo in emos:
-            spk = _get_speaker(emo)
-            scores = _normalize_labels(_get_scores(emo))
+            sc = emo.scores
+            for lab, v in sc.items():
+                sum_all[lab] += v
+                overall_sum[lab] += v
+            n_all += 1
+            overall_cnt += 1
 
-            for lab, fv in scores.items():
-                sum_all[lab] += fv
-                overall_sum[lab] += fv; overall_cnt += 1
-                if spk == "BF":
-                    sum_bf[lab] += fv; cnt_bf += 1
-                    overall_bf_sum[lab] += fv; overall_bf_cnt += 1
-                elif spk == "GF":
-                    sum_gf[lab] += fv; cnt_gf += 1
-                    overall_gf_sum[lab] += fv; overall_gf_cnt += 1
+            if emo.userId is not None:
+                uid = str(emo.userId)
+                for lab, v in sc.items():
+                    sum_user[uid][lab] += v
+                    per_user_sum[uid][lab] += v
+                cnt_user[uid] += 1
+                per_user_cnt[uid] += 1
 
-        n = max(len(emos), 1)
-        avg_scores = {lab: _clamp01(sum_all.get(lab, 0.0) / n) for lab in labels}
-        bf_avg = ({lab: _clamp01(sum_bf.get(lab, 0.0) / cnt_bf) for lab in labels} if cnt_bf > 0 else {})
-        gf_avg = ({lab: _clamp01(sum_gf.get(lab, 0.0) / cnt_gf) for lab in labels} if cnt_gf > 0 else {})
-
-        # ★ 표시용 반올림 적용
-        avg_scores = _round_scores(avg_scores)
-        if bf_avg: bf_avg = _round_scores(bf_avg)
-        if gf_avg: gf_avg = _round_scores(gf_avg)
-
-        timeline.append({
+        minute_obj: Dict[str, Any] = {
             "minute": minute,
-            "avg_scores": avg_scores,
-            "bf_avg_scores": bf_avg,
-            "gf_avg_scores": gf_avg
-        })
+            "avg_scores": _round_scores(_avg(sum_all, n_all)),
+        }
+        # ✅ 각 사용자에 대해 "<userId>_avg_scores" 키 생성
+        for uid, c in cnt_user.items():
+            minute_obj[f"{uid}_avg_scores"] = _round_scores(_avg(sum_user[uid], c))
 
-    def _avg(sum_dict: Dict[str, float], denom: int) -> Dict[str, float]:
-        return {lab: _clamp01(sum_dict.get(lab, 0.0) / denom) for lab in labels} if denom > 0 else {lab: 0.0 for lab in labels}
+        timeline.append(minute_obj)
 
-    overall = {
-        "avg_scores": _avg(overall_sum, overall_cnt),
-        "bf_avg_scores": _avg(overall_bf_sum, overall_bf_cnt),
-        "gf_avg_scores": _avg(overall_gf_sum, overall_gf_cnt),
+    # overall
+    overall_obj: Dict[str, Any] = {
+        "avg_scores": _round_scores(_avg(overall_sum, overall_cnt)),
     }
+    # ✅ 사용자별 키
+    for uid, c in per_user_cnt.items():
+        overall_obj[f"{uid}_avg_scores"] = _round_scores(_avg(per_user_sum[uid], c))
 
-    # ★ overall도 반올림
-    overall = _round_nested(overall)
+    # (선택) 하위호환(bf/gf) 제공
+    deprecated_obj: Dict[str, Any] = {}
+    bf_id = role_binding.get("BF")
+    gf_id = role_binding.get("GF")
+    if bf_id is not None and f"{bf_id}_avg_scores" in overall_obj:
+        deprecated_obj["bf_avg_scores"] = overall_obj[f"{bf_id}_avg_scores"]
+    if gf_id is not None and f"{gf_id}_avg_scores" in overall_obj:
+        deprecated_obj["gf_avg_scores"] = overall_obj[f"{gf_id}_avg_scores"]
 
-    return {"interval": "1min", "timeline": timeline, "overall": overall}
+    return {
+        "interval": "1min",
+        "timeline": timeline,
+        "overall": overall_obj,
+        "deprecated": deprecated_obj
+    }
 
 # ===== 헬스체크 =====
 @app.get("/health")
@@ -246,6 +307,8 @@ def health():
 def analyze_chat(request: ChatRequest, api_key: str = Depends(get_api_key)):
     """
     문맥 반영: 직전 N개(history)+현재 발화로 분석 (기본 N=2)
+    speaker는 "BF"/"GF" 또는 실제 userId 문자열 허용.
+    응답에서는 반드시 speaker에 실제 userId를 넣어 반환.
     """
     # 지연 임포트
     from .inference import analyze_sentence_with_context
@@ -254,17 +317,23 @@ def analyze_chat(request: ChatRequest, api_key: str = Depends(get_api_key)):
     history: List[Dict[str, str]] = []
 
     for emo in request.emotions:
+        # === 추론 ===
         current = {"speaker": emo.speaker, "text": emo.sentence}
         scores, label, confidence = analyze_sentence_with_context(history, current, context_size=2)
 
-        # 8라벨 분포로 보정
+        # 8라벨 분포 보정 및 반올림(표시용)
         scores = _normalize_labels(scores)
-        # ★ 개별 문장 score 반올림(표시용)
         scores = _round_scores(scores)
+
+        # === speaker → 실제 userId 변환 ===
+        uid = _resolve_user_id(emo, request.role_binding)   # 문자열(UUID/ID)
+        alias = _alias_of(uid, request.role_binding) if uid is not None else (emo.speaker or None)
 
         analyzed_emotions.append(
             EmotionResponse(
-                speaker=emo.speaker,
+                speaker=(str(uid) if uid is not None else None),  # ✅ 규격: 실제 userId
+                userId=(str(uid) if uid is not None else None),
+                alias=alias,
                 sentence=emo.sentence,
                 scores=scores,
                 emotion_label=label,
@@ -273,12 +342,15 @@ def analyze_chat(request: ChatRequest, api_key: str = Depends(get_api_key)):
                 sent_at=emo.sent_at,
             )
         )
+        # 컨텍스트는 원본 발화자 문자열 유지해도 무방(모델 내부 문맥용)
         history.append(current)
 
-    aggregated = calculate_aggregated(
-        [to_dict(e) for e in analyzed_emotions],
-        request.chat_session.start_at,
-        request.chat_session.end_at,
+    # === 집계 ===
+    aggregated = calculate_aggregated_user_centric(
+        emotions=analyzed_emotions,
+        start_at=request.chat_session.start_at,
+        end_at=request.chat_session.end_at,
+        role_binding=request.role_binding,
     )
 
     return {
