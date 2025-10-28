@@ -1,80 +1,170 @@
-from typing import List, Dict, Tuple
+# kc_ai_app/src/inference.py
+# -*- coding: utf-8 -*-
 import os
+import functools
+from typing import List, Dict, Union, Optional, Tuple
+
 import torch
-from kc_ai_app.model.model_loader import load_model
-from kc_ai_app.src.label_map import LABEL_DISPLAY_MAP
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
-LABELS = ["기쁨", "설렘", "애정", "편안함", "농담", "슬픔", "서운함", "실망", "후회", "미안함", "짜증", "화남", "질투", "불안", "의심", "중립"]
+# ===== 라벨: 학습과 동일(8클래스) =====
+LABELS: List[str] = ["기쁨", "설렘", "실망", "후회", "슬픔", "짜증", "불안", "중립"]
+LABEL2ID = {l: i for i, l in enumerate(LABELS)}
+ID2LABEL = {i: l for l, i in LABEL2ID.items()}
 
-# 디바이스 선택 (환경변수 DEVICE가 있으면 사용, 기본은 cpu)
-DEVICE = os.getenv("DEVICE") or ("cuda" if torch.cuda.is_available() else "cpu")
+SPECIAL_TOKENS = {"additional_special_tokens": ["[GF]", "[BF]", "[CTX]"]}
 
-# 모델/토크나이저는 프로세스 시작 시 1회 로드
-# load_model은 이제 파인튜닝 모델만 로드하고, 경로가 없으면 예외를 던지도록 변경됨
-tokenizer, model = load_model(device=DEVICE)
-
-def _softmax_logits(logits) -> List[float]:
-    # 배치=1 가정: dim=-1로 소프트맥스 후 1차원 리스트로 반환
-    return torch.nn.functional.softmax(logits, dim=-1).squeeze(0).tolist()
-
-def _aggregate_display_scores(scores: Dict[str, float]) -> Dict[str, float]:
-    """🔹 세부 감정을 대표 감정 기준으로 합산"""
-    aggregated: Dict[str, float] = {}
-    for sub_label, prob in scores.items():
-        display_label = LABEL_DISPLAY_MAP.get(sub_label, sub_label)
-        aggregated[display_label] = aggregated.get(display_label, 0.0) + prob
-    return {k: round(v, 4) for k, v in aggregated.items()}
-
-def analyze_sentence(sentence: str) -> Tuple[Dict[str, float], str, float]:
+def ensure_special_tokens(tokenizer, model) -> None:
     """
-    문장 단일 분석(문맥 미사용). 필요 시 내부적으로 사용.
+    토크나이저에 [GF]/[BF]/[CTX]가 없으면 추가하고,
+    모델 임베딩 크기와 토크나이저 vocab 크기가 다르면 리사이즈한다.
+    (훈련 때 이미 포함되어 있으면 아무 것도 하지 않음)
     """
-    inputs = tokenizer(sentence, return_tensors="pt", truncation=True, padding=True, max_length=128)
-    inputs = {k: v.to(model.device) for k, v in inputs.items()}
+    need_add = []
+    unk_id = tokenizer.unk_token_id
+    for t in SPECIAL_TOKENS["additional_special_tokens"]:
+        tid = tokenizer.convert_tokens_to_ids(t)
+        if tid == unk_id:
+            need_add.append(t)
+    if need_add:
+        tokenizer.add_special_tokens({"additional_special_tokens": need_add})
+    # 모델 임베딩 크기와 토크나이저 vocab 크기 동기화
+    if hasattr(model, "resize_token_embeddings"):
+        if model.get_input_embeddings().num_embeddings != len(tokenizer):
+            model.resize_token_embeddings(len(tokenizer))
 
-    with torch.no_grad():
-        outputs = model(**inputs)
-        probs = _softmax_logits(outputs.logits)
-
-    # 원본 감정 확률
-    raw_scores = {LABELS[i]: probs[i] for i in range(len(LABELS))}
-
-    # 🔹 대표 감정으로 합산
-    display_scores = _aggregate_display_scores(raw_scores)
-
-    # 🔹 대표 감정 중 최대값 선택
-    best_label = max(display_scores, key=display_scores.get)
-    confidence = display_scores[best_label]
-
-    return display_scores, best_label, float(confidence)
-
-def _build_context_text(history: List[Dict[str, str]], current: Dict[str, str], context_size: int = 2) -> str:
+def load_model_and_tokenizer(
+    model_dir_or_id: str,
+    device: Optional[Union[str, torch.device]] = None
+) -> Tuple[AutoTokenizer, AutoModelForSequenceClassification, torch.device]:
     """
-    직전 N개의 발화(context_size) + 현재 발화를 하나의 시퀀스로 연결.
-    스피커 정보도 함께 넣어 문맥을 보존.
-    history: [{"speaker": "BF", "text": "..."}, ...]
-    current: {"speaker": "...", "text": "..."}
+    HF 포맷(로컬 폴더/허깅페이스 ID)에서 모델/토크나이저 로드.
     """
-    ctx = history[-context_size:] if context_size > 0 else []
-    parts = [f"[{utt['speaker']}] {utt['text']}" for utt in ctx]
-    parts.append(f"[{current['speaker']}] {current['text']}")
-    return " ".join(parts)
+    device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
-def analyze_sentence_with_context(history: List[Dict[str, str]], current: Dict[str, str], context_size: int = 2) -> Tuple[Dict[str, float], str, float]:
+    tokenizer = AutoTokenizer.from_pretrained(model_dir_or_id, use_fast=True)
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_dir_or_id,
+        num_labels=len(LABELS),
+        id2label=ID2LABEL,
+        label2id=LABEL2ID,
+    )
+    ensure_special_tokens(tokenizer, model)
+    model.eval().to(device)
+    return tokenizer, model, device
+
+# ===== 모델 로딩 캐시(요청마다 재로딩 방지) =====
+@functools.lru_cache(maxsize=1)
+def _cached_load(model_id: str):
+    return load_model_and_tokenizer(model_id)
+
+def preprocess_texts(
+    texts: List[str],
+    speaker: Optional[str] = None,
+    ctx: Optional[str] = None
+) -> List[str]:
     """
-    문맥/대화 흐름을 반영한 문장 분석.
+    간단 전처리: (선택) 화자토큰/[CTX] 컨텍스트를 앞에 붙임.
+    - speaker: "GF" | "BF" | None
+    - ctx: 직전 대화 맥락 문자열(없으면 무시)
     """
-    text = _build_context_text(history, current, context_size=context_size)
-    inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True, max_length=256)
-    inputs = {k: v.to(model.device) for k, v in inputs.items()}
+    prefix_spk = f"[{speaker}] " if speaker in ("GF", "BF") else ""
+    prefix_ctx = f"[CTX] {ctx} " if ctx else ""
+    return [f"{prefix_ctx}{prefix_spk}{t}".strip() for t in texts]
 
-    with torch.no_grad():
-        outputs = model(**inputs)
-        probs = _softmax_logits(outputs.logits)
+@torch.inference_mode()
+def predict_proba(
+    tokenizer, model, device, texts: List[str],
+    max_length: int = 256, padding: str = "longest", batch_size: int = 32,
+    **_  # ← 호출부에서 넘어올 수 있는 labels 등 예기치 않은 키워드 무시
+) -> List[Dict[str, float]]:
+    """
+    다중 문장 확률 예측.
+    반환: [{라벨: 확률, ...}, ...]
+    """
+    softmax = torch.nn.Softmax(dim=-1)
+    out: List[Dict[str, float]] = []
 
-    raw_scores = {LABELS[i]: probs[i] for i in range(len(LABELS))}
-    display_scores = _aggregate_display_scores(raw_scores)
-    best_label = max(display_scores, key=display_scores.get)
-    confidence = display_scores[best_label]
+    for i in range(0, len(texts), batch_size):
+        chunk = texts[i:i+batch_size]
+        enc = tokenizer(
+            chunk,
+            return_tensors="pt",
+            truncation=True,
+            padding=padding,
+            max_length=max_length,
+        )
+        # Electra 계열은 token_type_ids가 모두 0 → 전달 생략 가능(있어도 무방)
+        enc = {k: v.to(device) for k, v in enc.items() if k != "token_type_ids"}
 
-    return display_scores, best_label, float(confidence)
+        logits = model(**enc).logits  # [B, C]
+        probs = softmax(logits).cpu().tolist()
+
+        for p in probs:
+            out.append({LABELS[j]: float(p[j]) for j in range(len(LABELS))})
+    return out
+
+def predict_label(
+    tokenizer, model, device, text: str,
+    speaker: Optional[str] = None, ctx: Optional[str] = None,
+    **kw,
+) -> Dict[str, Union[str, float, Dict[str, float]]]:
+    """
+    단일 문장 예측(+선택적 화자/컨텍스트)
+    """
+    proc = preprocess_texts([text], speaker=speaker, ctx=ctx)
+    probs = predict_proba(tokenizer, model, device, proc, **kw)[0]
+    label = max(probs, key=probs.get)
+    return {"label": label, "score": probs[label], "probs": probs}
+
+# ---- compat shim: API가 기대하는 심볼 제공 ----
+def analyze_sentence_with_context(
+    history: Optional[List[Dict[str, str]]],
+    current: Dict[str, str],
+    context_size: int = 2,
+    labels: Optional[List[str]] = None,
+    **kwargs,
+):
+    """
+    history: [{"speaker":"BF|GF", "text" 또는 "sentence": "..."} ...]
+    current: {"speaker":"...", "text" 또는 "sentence":"..."}
+    반환: (scores: Dict[str, float], label: str, confidence: float)
+    """
+    # 0) 모델 경로/ID 결정 (로컬이든 허브 ID든 문자열이면 됨)
+    model_id = os.getenv("MODEL_DIR") or os.getenv("FINETUNED_MODEL_PATH")
+    if not model_id:
+        raise RuntimeError(
+            "MODEL_DIR 또는 FINETUNED_MODEL_PATH 환경변수가 필요합니다."
+        )
+
+    # 1) 모델/토크나이저/디바이스 로드 (캐시 사용)
+    tokenizer, model, device = _cached_load(model_id)
+
+    # 2) 문맥 구성: 최근 N개(history) + 현재 발화
+    def _t(x: Optional[Dict[str, str]]) -> str:
+        if not x:
+            return ""
+        return x.get("text") or x.get("sentence") or ""
+    hist = (history or [])[-int(context_size):]
+    ctx_text = " ".join([_t(h) for h in hist if _t(h)])
+    cur_text = _t(current)
+    speaker = (current or {}).get("speaker")
+
+    # 3) 후보 라벨 세트(없으면 기본 LABELS 사용) — 현재 모델 추론에는 직접 미사용
+    _ = labels or LABELS  # 유지: 호출부 호환성(넘어와도 에러 안 나게)
+
+    # 4) 실제 추론 (predict_label은 Dict 반환: {"label","score","probs"})
+    out = predict_label(
+        tokenizer=tokenizer,
+        model=model,
+        device=device,
+        text=cur_text,
+        speaker=speaker,
+        ctx=ctx_text,
+        labels=labels,  # 넘어올 수 있으므로 그대로 전달( predict_proba에서 **_로 무시 )
+    )
+    # api.py의 기대 형태에 맞게 변환
+    scores = out["probs"]
+    label = out["label"]
+    confidence = out["score"]
+    return scores, label, confidence

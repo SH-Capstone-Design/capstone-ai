@@ -11,7 +11,7 @@ tokenizers==0.22.0
 fastapi==0.116.1
 uvicorn==0.35.0
 starlette==0.46.2
-
+                                                            
 # 데이터 모델링 & 유틸
 pydantic==2.11.7
 python-dateutil==2.9.0.post0
