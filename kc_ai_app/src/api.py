@@ -186,12 +186,12 @@ def calculate_aggregated_user_centric(
       timeline[i] = {
         "minute": <int>,
         "avg_scores": {...},
-        "<userId>_avg_scores": {...},   # 사용자 수 만큼 반복
+        "<userId>_avg_scores": {...},
         ...
       }
       overall = {
-        "avg_scores": {...},            # 전체 평균
-        "<userId>_avg_scores": {...},   # 사용자 수 만큼 반복
+        "avg_scores": {...},
+        "<userId>_avg_scores": {...},
         ...
       }
     deprecated: 선택적으로 bf/gf 하위호환 제공
@@ -204,9 +204,41 @@ def calculate_aggregated_user_centric(
     if end_dt.tzinfo   is None: end_dt   = end_dt.replace(tzinfo=timezone.utc)
     start_min = _to_utc_floor_min(start_dt)
     end_min   = _to_utc_floor_min(end_dt)
+
+def calculate_aggregated_user_centric(
+    emotions: List[EmotionResponse],
+    start_at: str,
+    end_at: str,
+    role_binding: Dict[str, str]
+) -> Dict[str, Any]:
+    """
+    출력:
+      timeline[i] = {
+        "minute": <int>,
+        "avg_scores": {...},
+        "<userId>_avg_scores": {...},
+        ...
+      }
+      overall = {
+        "avg_scores": {...},
+        "<userId>_avg_scores": {...},
+        ...
+      }
+    deprecated: 선택적으로 bf/gf 하위호환 제공
+    """
+    _assert_inference_ready([to_dict(e) for e in emotions])
+
+    start_dt = _parse_iso(start_at)
+    end_dt   = _parse_iso(end_at)
+    if start_dt.tzinfo is None: start_dt = start_dt.replace(tzinfo=timezone.utc)
+    if end_dt.tzinfo   is None: end_dt   = end_dt.replace(tzinfo=timezone.utc)
+    start_min = _to_utc_floor_min(start_dt)
+    end_min   = _to_utc_floor_min(end_dt)
+
+    # ✅ 1분 미만 세션도 집계되도록 최소 1분 보장
     total_minutes = int((end_min - start_min).total_seconds() // 60)
     if total_minutes <= 0:
-        raise ValueError(f"[aggregation] 세션 시간이 0분입니다. start_at={start_at}, end_at={end_at}")
+        total_minutes = 1
 
     minute_buckets: Dict[int, List[EmotionResponse]] = defaultdict(list)
     for emo in emotions:
@@ -214,8 +246,13 @@ def calculate_aggregated_user_centric(
             continue
         ts_min = _to_utc_floor_min(_parse_iso(emo.sent_at))
         minute = int((ts_min - start_min).total_seconds() // 60)
-        if 0 <= minute < total_minutes:
-            minute_buckets[minute].append(emo)
+        # minute을 세션 구간으로 클램프
+        if minute < 0:
+            continue
+        if minute >= total_minutes:
+            # end_at과 같은 분으로 들어오면 total_minutes==1일 때 minute==0만 유효
+            continue
+        minute_buckets[minute].append(emo)
 
     if not minute_buckets:
         return {
@@ -228,10 +265,8 @@ def calculate_aggregated_user_centric(
     def _avg(sum_dict: Dict[str, float], denom: int) -> Dict[str, float]:
         return {lab: _clamp01(sum_dict.get(lab, 0.0) / max(denom, 1)) for lab in LABELS8}
 
-    # 전체 합산
     overall_sum: Dict[str, float] = defaultdict(float)
     overall_cnt = 0
-    # per-user 합산
     per_user_sum: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
     per_user_cnt: Dict[str, int] = defaultdict(int)
 
@@ -240,10 +275,8 @@ def calculate_aggregated_user_centric(
     for minute in sorted(minute_buckets.keys()):
         emos = minute_buckets[minute]
 
-        # 분 전체
         sum_all: Dict[str, float] = defaultdict(float)
         n_all = 0
-        # 분 per-user
         sum_user: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
         cnt_user: Dict[str, int] = defaultdict(int)
 
@@ -267,21 +300,17 @@ def calculate_aggregated_user_centric(
             "minute": minute,
             "avg_scores": _round_scores(_avg(sum_all, n_all)),
         }
-        # ✅ 각 사용자에 대해 "<userId>_avg_scores" 키 생성
         for uid, c in cnt_user.items():
             minute_obj[f"{uid}_avg_scores"] = _round_scores(_avg(sum_user[uid], c))
 
         timeline.append(minute_obj)
 
-    # overall
     overall_obj: Dict[str, Any] = {
         "avg_scores": _round_scores(_avg(overall_sum, overall_cnt)),
     }
-    # ✅ 사용자별 키
     for uid, c in per_user_cnt.items():
         overall_obj[f"{uid}_avg_scores"] = _round_scores(_avg(per_user_sum[uid], c))
 
-    # (선택) 하위호환(bf/gf) 제공
     deprecated_obj: Dict[str, Any] = {}
     bf_id = role_binding.get("BF")
     gf_id = role_binding.get("GF")
