@@ -1,6 +1,7 @@
 # kc_ai_app/src/inference.py
 # -*- coding: utf-8 -*-
 import os
+import re
 import functools
 from typing import List, Dict, Union, Optional, Tuple
 
@@ -13,6 +14,114 @@ LABEL2ID = {l: i for i, l in enumerate(LABELS)}
 ID2LABEL = {i: l for l, i in LABEL2ID.items()}
 
 SPECIAL_TOKENS = {"additional_special_tokens": ["[GF]", "[BF]", "[CTX]"]}
+
+# ===== (추가) 휴리스틱 파라미터: .env 없으면 기본값 사용 =====
+def _env_float(key: str, default: float) -> float:
+    try:
+        v = float(os.getenv(key, default))
+        return v
+    except Exception:
+        return default
+
+def _env_bool(key: str, default: bool) -> bool:
+    v = os.getenv(key)
+    if v is None:
+        return default
+    return v.strip() in ("1", "true", "True", "yes", "YES")
+
+ENABLE_HEURISTIC: bool = _env_bool("ENABLE_HEURISTIC", True)  # 휴리스틱 켜기/끄기
+KEYWORD_ALPHA: float   = _env_float("KEYWORD_ALPHA", 0.22)    # 키워드 가산 강도
+NEGATION_BETA: float   = _env_float("NEGATION_BETA", 0.15)    # 부정 감쇠 강도
+SHARP_GAMMA: float     = _env_float("SHARP_GAMMA", 0.80)      # 확률 샤프닝(γ<1 뾰족)
+NEUTRAL_TH: float      = _env_float("NEUTRAL_TH", 0.45)       # 최고확률이 임계 미만이면 중립 복귀
+
+# ===== (추가) 간단 키워드 사전 =====
+# 필요 시 자유롭게 보강하세요.
+LEXICON: Dict[str, List[str]] = {
+    "기쁨": ["좋아", "좋다", "행복", "즐거", "완전 좋", "짱", "대박", "웃겨", "뿌듯", "사랑해", "좋지"],
+    "설렘": ["설레", "두근", "기대", "가보자", "가자", "재밌겠", "좋을듯", "신나", "콜~", "오키", "좋겠다"],
+    "실망": ["실망", "아쉽", "별로였", "기대 이하", "그닥", "실망스"],
+    "후회": ["후회", "그럴걸", "그랬어야", "괜히", "다음엔", "다시는"],
+    "슬픔": ["슬프", "우울", "눈물", "속상", "서럽", "힘들었", "괜찮지 않"],
+    "짜증": ["짜증", "빡치", "열받", "개", "씨발", "젠장", "피곤하", "귀찮", "노답", "답답"],
+    "불안": ["불안", "걱정", "괜찮을까", "무섭", "걱정되", "긴장", "찝찝", "불편하"],
+    "중립": ["그래", "응", "알겠", "확인", "오케이", "그러", "그래서", "음", "웅", "넵"],
+}
+
+# ===== (추가) 부정/부정어 패턴 =====
+NEG_PATTERNS: List[re.Pattern] = [
+    re.compile(p) for p in [
+        r"\b아니\b", r"\b아냐\b", r"\b아닌\b", r"\b아녔", r"\b싫", r"\b별로\b",
+        r"\b안\s", r"\b못\s", r"\b없어\b", r"\b노노\b", r"\bㄴㄴ\b"
+    ]
+]
+
+def _contains_negation(text: str) -> bool:
+    for pat in NEG_PATTERNS:
+        if pat.search(text):
+            return True
+    return False
+
+def _clamp01(x: float) -> float:
+    if x < 0.0: return 0.0
+    if x > 1.0: return 1.0
+    return x
+
+def _normalize_dist(dist: Dict[str, float]) -> Dict[str, float]:
+    # 음수를 방지하고, 합 1로 정규화
+    safe = {k: max(0.0, float(v)) for k, v in dist.items()}
+    s = sum(safe.values())
+    if s <= 0:
+        # 완전히 0이면 균등 분포(중립 가중)로 복귀
+        n = len(LABELS)
+        return {k: (1.0 / n) for k in LABELS}
+    return {k: v / s for k, v in safe.items()}
+
+def _sharpen(dist: Dict[str, float], gamma: float) -> Dict[str, float]:
+    # 확률 샤프닝: p_i' = p_i^γ / sum_j p_j^γ  (γ<1 → 뾰족)
+    if gamma == 1.0:
+        return dist
+    powered = {k: (v ** gamma) for k, v in dist.items()}
+    return _normalize_dist(powered)
+
+def _keyword_boost(text: str, dist: Dict[str, float], alpha: float) -> Dict[str, float]:
+    if alpha <= 0:
+        return dist
+    t = text.lower()
+    bumped = dist.copy()
+    for label, keys in LEXICON.items():
+        for kw in keys:
+            if kw.lower() in t:
+                bumped[label] = bumped.get(label, 0.0) + alpha
+                break  # 한 라벨에 여러 키워드가 있어도 1회만 가산
+    return _normalize_dist(bumped)
+
+def _negation_adjust(text: str, dist: Dict[str, float], beta: float) -> Dict[str, float]:
+    if beta <= 0 or not _contains_negation(text):
+        return dist
+    # 부정어가 있으면 긍정 계열(기쁨/설렘)을 감쇠하고, 부정 계열(짜증/실망/불안/슬픔)을 미세 가산
+    adj = dist.copy()
+    pos = ["기쁨", "설렘"]
+    neg = ["짜증", "실망", "불안", "슬픔"]
+    for p in pos:
+        adj[p] = max(0.0, adj.get(p, 0.0) * (1.0 - beta))
+    for n in neg:
+        adj[n] = adj.get(n, 0.0) + (beta / len(neg))
+    return _normalize_dist(adj)
+
+def _neutral_fallback(dist: Dict[str, float], th: float) -> Dict[str, float]:
+    # 최고 확률이 임계 미만이면 중립으로 소폭 복귀(너무 애매하면 중립 쪽으로)
+    if th <= 0:
+        return dist
+    best_label = max(dist, key=dist.get)
+    if dist[best_label] >= th:
+        return dist
+    nudged = dist.copy()
+    # 중립에 작은 보너스, 그 외는 균등 감쇠
+    bonus = 0.05
+    nudged["중립"] = nudged.get("중립", 0.0) + bonus
+    # 정규화로 자동 보정
+    return _normalize_dist(nudged)
 
 def ensure_special_tokens(tokenizer, model) -> None:
     """
@@ -104,6 +213,28 @@ def predict_proba(
             out.append({LABELS[j]: float(p[j]) for j in range(len(LABELS))})
     return out
 
+def _apply_heuristics(text: str, probs: Dict[str, float]) -> Dict[str, float]:
+    """
+    (추가) 체감 성능 향상을 위한 휴리스틱 파이프라인.
+      1) 키워드 부스팅
+      2) 부정어 감쇠/가산
+      3) 샤프닝
+      4) 중립 복귀(최고확률이 낮으면)
+    """
+    if not ENABLE_HEURISTIC:
+        return probs
+
+    dist = _normalize_dist(probs)
+    # 1) 키워드 부스팅
+    dist = _keyword_boost(text, dist, KEYWORD_ALPHA)
+    # 2) 부정어 감쇠/가산
+    dist = _negation_adjust(text, dist, NEGATION_BETA)
+    # 3) 샤프닝
+    dist = _sharpen(dist, SHARP_GAMMA)
+    # 4) 중립 복귀
+    dist = _neutral_fallback(dist, NEUTRAL_TH)
+    return dist
+
 def predict_label(
     tokenizer, model, device, text: str,
     speaker: Optional[str] = None, ctx: Optional[str] = None,
@@ -114,6 +245,10 @@ def predict_label(
     """
     proc = preprocess_texts([text], speaker=speaker, ctx=ctx)
     probs = predict_proba(tokenizer, model, device, proc, **kw)[0]
+
+    # (추가) 휴리스틱 적용 — 실제 입력 원문(text)을 기준으로 보정
+    probs = _apply_heuristics(text, probs)
+
     label = max(probs, key=probs.get)
     return {"label": label, "score": probs[label], "probs": probs}
 
