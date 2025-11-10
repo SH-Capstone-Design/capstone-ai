@@ -34,16 +34,17 @@ DL 프레임워크: PyTorch
 주의: 아래 트리는 공백으로 정렬된 코드블록입니다. 그대로 복사해도 모양이 유지됩니다.
 
 kc_ai_app/
-├─ src/
-│  ├─ __init__.py
-│  ├─ api.py               # FastAPI 엔드포인트 (/health, /analyze), 집계/반올림/검증
-│  └─ inference.py         # 모델 로드/추론/문맥 처리, 휴리스틱(키워드/부정어/샤프닝/중립복귀)
-├─ models/
-│  └─ kcelectra-base-emotion/   # config.json, tokenizer.json, pytorch_model.bin ...
-├─ app.py                   # uvicorn 엔트리포인트 (from src.api import app)
-├─ .env                     # API_KEY, FINETUNED_MODEL_PATH 등
-├─ requirements.txt
-└─ README.md
++-- src/
+|   +-- __init__.py
+|   +-- api.py            # FastAPI 엔드포인트 (/health, /analyze), 집계/반올림/검증
+|   +-- inference.py      # 모델 로드/추론/문맥 처리, 휴리스틱(키워드/부정어/샤프닝/중립복귀)
++-- models/
+|   +-- kcelectra-base-emotion/   # config.json, tokenizer.json, pytorch_model.bin ...
++-- app.py                # uvicorn 엔트리포인트 (from src.api import app)
++-- .env                  # API_KEY, FINET운ED_MODEL_PATH 등
++-- requirements.txt
++-- README.md
+
 
 ⚙️ 환경 설정 (.env)
 # 필수
@@ -51,7 +52,6 @@ API_KEY
 
 # 모델 경로
 FINETUNED_MODEL_PATH", "JeongMin05/kcelectra-base-chat-emotion
-
 
 🚀 실행 방법
 # 가상환경
