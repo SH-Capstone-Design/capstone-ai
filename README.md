@@ -27,41 +27,29 @@
 - 아래 트리는 공백 정렬된 코드블록입니다. 그대로 복사해도 모양이 유지됩니다.
 
 ```text
-kc_ai_app/
-├─ src/
-│  ├─ __init__.py
-│  ├─ api.py               # FastAPI 엔드포인트 (/health, /analyze), 집계/반올림/검증
-│  └─ inference.py         # 모델 로드/추론/문맥 처리, 휴리스틱(키워드/부정어/샤프닝/중립복귀)
-├─ models/
-│  └─ kcelectra-base-emotion/   # config.json, tokenizer.json, pytorch_model.bin ...
+capstone-ai
+├─ kc_ai_app/
+│  ├─ src/
+│  │  ├─ __init__.py
+│  │  ├─ api.py               # FastAPI 엔드포인트 (/health, /analyze), 집계/반올림/검증
+│  │  └─ inference.py         # 모델 로드/추론/문맥 처리, 휴리스틱(키워드/부정어/샤프닝/중립복귀)
 ├─ app.py                   # uvicorn 엔트리포인트 (from src.api import app)
 ├─ .env                     # API_KEY, FINETUNED_MODEL_PATH 등
 ├─ requirements.txt
-└─ README.md
+├─ models/
+│  └─ kcelectra-base-emotion/   # config.json, tokenizer.json, pytorch_model.bin ...
+└─README.md
 ```
 
 ## 환경 설정 (.env 예시)
 
 ```ini
 # 필수
-API_KEY=your-secret-key
+API_KEY=
 
-# 모델 경로: 로컬 디렉토리 또는 허깅페이스 모델 ID
-# 미설정 시 기본값: models/kcelectra-base-emotion
+# 모델 경로: 허깅페이스 모델 ID
 FINETUNED_MODEL_PATH=JeongMin05/kcelectra-base-chat-emotion
 
-# (선택) 휴리스틱 ON/OFF 및 강도
-HEURISTIC_KEYWORD_BOOST=true
-BOOST_FACTOR=0.18
-
-HEURISTIC_NEGATION_DAMPING=true
-NEG_DAMP_FACTOR=0.12
-
-HEURISTIC_SHARPENING=true
-SHARPEN_GAMMA=1.25
-
-HEURISTIC_NEUTRAL_FALLBACK=true
-NEUTRAL_THRESHOLD=0.33
 ```
 
 ## 실행 방법
@@ -143,20 +131,6 @@ uvicorn kc_ai_app.app:app --host 0.0.0.0 --port 8081 --reload
 
 - 모든 API 호출에 `x-api-key` 필수 (불일치 시 401 Unauthorized)
 - 모델 경로는 환경변수로만 주입(.env / 시스템 환경변수)
-
-## 백엔드 연동 가이드(권장)
-
-- DB 스키마(예시)
-  ```text
-  emotion_events (원천 발화)
-  - session_id, user_id, sentence, scores_raw(JSON), label, confidence, sent_at, analyzed_at
-
-  emotion_agg_minutely (옵션, 배치 집계 보관)
-  - session_id, minute, avg_scores(JSON), user_avg_scores(JSON), ...
-  ```
-- 프론트 표시
-  - 차트/게이지 등 표시에는 반올림된 `scores` 사용
-  - 툴팁/세부 패널에서는 `scores_raw`(원본) 사용 권장
 
 ## 라이선스 / 크레딧
 
