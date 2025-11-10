@@ -36,11 +36,14 @@ DL 프레임워크: PyTorch
 kc_ai_app/
 ├─ src/
 │  ├─ __init__.py
-│  ├─ api.py                 # FastAPI 엔드포인트 (/health, /analyze)
-│  └─ inference.py           # KcELECTRA 로드/추론/문맥 처리
-├─ .env                      # API_KEY, 모델 경로 등 환경변수
-├─ requirements.txt          # 의존성
-└─ README.md                 
+│  ├─ api.py           # FastAPI 엔드포인트 (/health, /analyze), 집계/반올림/검증
+│  └─ inference.py     # 모델 로드/추론/문맥 처리, 휴리스틱(키워드/부정어/샤프닝/중립복귀)
+├─ models/
+│  └─ kcelectra-base-emotion/ (config.json, tokenizer.json, pytorch_model.bin ...)
+├─ .env                # API_KEY, FINETUNED_MODEL_PATH 등
+├─ requirements.txt
+└─ README.md
+          
 
 
 ## 3) 환경 설정 (.env)
