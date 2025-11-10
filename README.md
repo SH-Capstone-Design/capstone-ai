@@ -41,7 +41,7 @@ kc_ai_app/
 +-- models/
 |   +-- kcelectra-base-emotion/   # config.json, tokenizer.json, pytorch_model.bin ...
 +-- app.py                # uvicorn 엔트리포인트 (from src.api import app)
-+-- .env                  # API_KEY, FINET운ED_MODEL_PATH 등
++-- .env                  # API_KEY, FINETUNED_MODEL_PATH 등
 +-- requirements.txt
 +-- README.md
 
